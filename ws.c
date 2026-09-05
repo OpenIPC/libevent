@@ -182,14 +182,22 @@ evws_close(struct evws_connection *evws, uint16_t reason)
 	struct evbuffer *output;
 	uint16_t *u16;
 
-	if (evws->closed)
+	/* Serialise with evws_send(): both hold the bufferevent lock, so once
+	 * "closed" is set here no data frame can be queued after the close
+	 * frame -- a peer that received the close and then a data frame fails
+	 * the connection ("Data frame received after close"). */
+	bufferevent_lock(evws->bufev);
+	if (evws->closed) {
+		bufferevent_unlock(evws->bufev);
 		return;
+	}
 	evws->closed = true;
 
 	u16 = (uint16_t *)&fr[2];
 	*u16 = htons((int16_t)reason);
 	output = bufferevent_get_output(evws->bufev);
 	evbuffer_add(output, fr, 4);
+	bufferevent_unlock(evws->bufev);
 
 	/* wait for close frame writing complete and close connection */
 	bufferevent_setcb(
@@ -519,8 +527,13 @@ evws_send(struct evws_connection *evws, enum WebSocketFrameType frame_type,
 	struct evbuffer *output;
 
 	bufferevent_lock(evws->bufev);
-	output = bufferevent_get_output(evws->bufev);
-	make_ws_frame(output, frame_type, (unsigned char *)packet_str, str_len);
+	/* Never queue a data frame once the close frame has been queued (see
+	 * evws_close()); the peer would see data after close and fail the
+	 * connection. */
+	if (!evws->closed) {
+		output = bufferevent_get_output(evws->bufev);
+		make_ws_frame(output, frame_type, (unsigned char *)packet_str, str_len);
+	}
 	bufferevent_unlock(evws->bufev);
 }
 
