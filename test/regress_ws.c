@@ -681,3 +681,134 @@ end:
 		bufferevent_free(bev);
 }
 
+
+/* Regression: a data frame must never be emitted after the close frame.
+ *
+ * evws_send() used to queue a frame without checking evws->closed, and
+ * evws_close() set that flag and queued the close frame without holding the
+ * bufferevent lock. An application that sent a frame around the time it closed
+ * -- here the upgrade handler closes and then sends, standing in for a producer
+ * that still had a frame in hand -- appended a data frame after the close
+ * frame. The peer receives a data frame after the close and fails the
+ * connection ("Data frame received after close" in Chromium). */
+static int ws_dac_saw_close;
+static int ws_dac_data_after_close;
+static int ws_dac_grace_armed;
+
+static void
+http_on_ws_data_after_close_cb(struct evhttp_request *req, void *arg)
+{
+	struct evws_connection *evws;
+	(void)arg;
+
+	evws = evws_new_session(req, NULL, NULL, 0);
+	if (!evws)
+		return;
+	/* Close, then hand off one more frame. A correct evws drops it. */
+	evws_close(evws, WS_CR_NORMAL);
+	evws_send_binary(evws, "\xde\xad\xbe\xef\x55", 5);
+}
+
+static void
+ws_dac_readcb(struct bufferevent *bev, void *arg)
+{
+	struct evbuffer *input = bufferevent_get_input(bev);
+	static int handshaken;
+	size_t nread;
+	char *line;
+
+	if (!handshaken) {
+		while ((line = evbuffer_readln(input, &nread, EVBUFFER_EOL_CRLF))) {
+			int blank = (line[0] == '\0');
+			free(line);
+			if (blank) {
+				handshaken = 1;
+				break;
+			}
+		}
+		if (!handshaken)
+			return;
+	}
+
+	/* Server frames are unmasked and short here. */
+	while (evbuffer_get_length(input) >= 2) {
+		unsigned char h[2];
+		int opcode;
+		size_t plen, frame;
+
+		evbuffer_copyout(input, h, 2);
+		opcode = h[0] & 0x0F;
+		plen = h[1] & 0x7F;
+		frame = 2 + plen;
+		if (evbuffer_get_length(input) < frame)
+			break;
+		if (opcode == 0x8) {
+			ws_dac_saw_close = 1;
+		} else if (opcode == 0x1 || opcode == 0x2) {
+			if (ws_dac_saw_close)
+				ws_dac_data_after_close = 1;
+		}
+		evbuffer_drain(input, frame);
+	}
+
+	if (ws_dac_saw_close && !ws_dac_grace_armed) {
+		/* A prohibited trailing data frame may not share this read; give it
+		 * a bounded moment to arrive before the test asserts. */
+		struct timeval grace = {0, 200000};
+		ws_dac_grace_armed = 1;
+		event_base_loopexit(exit_base, &grace);
+	}
+}
+
+static void
+ws_dac_errorcb(struct bufferevent *bev, short what, void *arg)
+{
+	(void)bev;
+	(void)what;
+	event_base_loopexit((struct event_base *)arg, NULL);
+}
+
+void
+http_ws_data_after_close_test(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct bufferevent *bev = NULL;
+	evutil_socket_t fd;
+	ev_uint16_t port = 0;
+	struct evhttp *http = http_setup(&port, data->base, 0);
+	struct evbuffer *out;
+	struct timeval tv = {5, 0};
+
+	exit_base = data->base;
+	ws_dac_saw_close = 0;
+	ws_dac_data_after_close = 0;
+	ws_dac_grace_armed = 0;
+
+	evhttp_set_cb(
+		http, "/ws_data_after_close", http_on_ws_data_after_close_cb, NULL);
+
+	fd = http_connect("127.0.0.1", port);
+	bev = create_bev(data->base, fd, 0, BEV_OPT_CLOSE_ON_FREE);
+	bufferevent_setcb(
+		bev, ws_dac_readcb, http_writecb, ws_dac_errorcb, data->base);
+	out = bufferevent_get_output(bev);
+
+	evbuffer_add_printf(out,
+		"GET /ws_data_after_close HTTP/1.1\r\n"
+		"Host: somehost\r\n"
+		"Connection: Upgrade\r\n"
+		"Upgrade: websocket\r\n"
+		"Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==\r\n"
+		"\r\n");
+
+	event_base_loopexit(data->base, &tv);
+	event_base_dispatch(data->base);
+
+	tt_int_op(ws_dac_saw_close, ==, 1);
+	tt_int_op(ws_dac_data_after_close, ==, 0);
+
+	evhttp_free(http);
+end:
+	if (bev)
+		bufferevent_free(bev);
+}

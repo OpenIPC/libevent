@@ -6448,6 +6448,7 @@ struct testcase_t http_testcases[] = {
 	HTTP(ws),
 	HTTP(ws_msg_limit),
 	HTTP_N(ws_early_free, ws_early_free, TT_NEED_THREADS, NULL),
+	HTTP(ws_data_after_close),
 #endif
 
 	HTTP(highport),
